@@ -149,6 +149,13 @@ async def ask():
         r = await approach.run(
             request_json["messages"], context=context, session_state=request_json.get("session_state")
         )
+
+        prompt_text = request_json["messages"][-1]["content"]
+        ai_reply = r["choices"][0]["message"]["content"]
+        session_id = request_json.get("session_state")
+        category = await categorize_question(prompt_text)
+        await log_to_sharepoint(prompt_text, ai_reply, session_id, category)
+
         return jsonify(r)
     except Exception as error:
         return error_response(error, "/ask")
@@ -165,7 +172,49 @@ async def categorize_question(question):
         max_tokens=100
     )
     return chat_completion.choices[0].message.content.strip()
-    return response.choices[0].message['content'].strip()
+
+
+async def log_to_sharepoint(question: str, response: str, session_id: str | None, category: str):
+    """Persist a Q&A record to the configured SharePoint list."""
+    timestamp = datetime.utcnow().isoformat()
+
+    tenant_id = os.getenv("SHAREPOINT_TENANT_ID")
+    client_id = os.getenv("SHAREPOINT_CLIENT_ID")
+    client_secret = os.getenv("SHAREPOINT_CLIENT_SECRET")
+    if not (tenant_id and client_id and client_secret):
+        raise RuntimeError("Azure AD credentials not set in env variables")
+
+    credential = ClientSecretCredential(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+    scope = os.getenv("SHAREPOINT_SCOPE", "https://graph.microsoft.com/.default")
+    token_response = await credential.get_token(scope)
+    access_token = token_response.token
+
+    sp_graph_url = os.getenv("SHAREPOINT_GRAPH_URL")
+    sp_library_name = os.getenv("SHAREPOINT_LIBRARY_NAME")
+    if not (sp_graph_url and sp_library_name):
+        raise RuntimeError("SharePoint Graph URL or Library name not set")
+
+    payload = {
+        "fields": {
+            "Title": timestamp,
+            "Question": question,
+            "Response": response,
+            "Category": category,
+            "Timestamp": timestamp,
+            "SessionID": session_id or "",
+        }
+    }
+
+    url = f"{sp_graph_url}/lists/{sp_library_name}/items"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
 
 
 @bp.route("/save", methods=["POST"])
@@ -186,9 +235,9 @@ async def save():
         new_item["category"] = category
 
         # 3) Acquire a Graph API access token via client‐credentials
-        tenant_id = os.getenv("AZURE_TENANT_ID")
-        client_id = os.getenv("AZURE_CLIENT_ID")
-        client_secret = os.getenv("AZURE_CLIENT_SECRET")
+        tenant_id = os.getenv("SHAREPOINT_TENANT_ID")
+        client_id = os.getenv("SHAREPOINT_CLIENT_ID")
+        client_secret = os.getenv("SHAREPOINT_CLIENT_SECRET")
         if not (tenant_id and client_id and client_secret):
             raise RuntimeError("Azure AD credentials not set in env variables")
 
@@ -199,15 +248,16 @@ async def save():
             client_secret=client_secret
         )
         # This scope is required for Graph service calls
-        token_response = await credential.get_token("https://graph.microsoft.com/.default")
+        scope = os.getenv("SHAREPOINT_SCOPE", "https://graph.microsoft.com/.default")
+        token_response = await credential.get_token(scope)
         access_token = token_response.token
 
         # 4) Build the JSON payload to create a new List item
         #    (Make sure the field-names match your SP List's internal field names exactly.)
-        sp_site_id = os.getenv("SHAREPOINT_SITE")
-        sp_list_id = os.getenv("SHAREPOINT_LIST_ID")
-        if not (sp_site_id and sp_list_id):
-            raise RuntimeError("SP_SITE_ID or SP_LIST_ID not set")
+        sp_graph_url = os.getenv("SHAREPOINT_GRAPH_URL")
+        sp_library_name = os.getenv("SHAREPOINT_LIBRARY_NAME")
+        if not (sp_graph_url and sp_library_name):
+            raise RuntimeError("SharePoint Graph URL or Library name not set")
 
         fields_payload = {
             "fields": {
@@ -229,10 +279,7 @@ async def save():
             }
         }
 
-        graph_url = (
-            f"https://graph.microsoft.com/v1.0/"
-            f"sites/{sp_site_id}/lists/{sp_list_id}/items"
-        )
+        graph_url = f"{sp_graph_url}/lists/{sp_library_name}/items"
 
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -307,10 +354,30 @@ async def chat():
 
         print("result = ",result)
 
+        prompt_text = request_json["messages"][-1]["content"]
+        session_id = request_json.get("session_state")
+        category = await categorize_question(prompt_text)
+
         if isinstance(result, dict):
+            ai_reply = result["choices"][0]["message"]["content"]
+            await log_to_sharepoint(prompt_text, ai_reply, session_id, category)
             return jsonify(result)
         else:
-            response = await make_response(format_as_ndjson(result))
+            async def log_wrapper(gen):
+                full_reply = ""
+                async for event in gen:
+                    if event.get("choices"):
+                        choice = event["choices"][0]
+                        delta = choice.get("delta", {})
+                        if "content" in delta and delta["content"]:
+                            full_reply += delta["content"]
+                        message = choice.get("message", {})
+                        if "content" in message and message["content"]:
+                            full_reply += message["content"]
+                    yield event
+                await log_to_sharepoint(prompt_text, full_reply, session_id, category)
+
+            response = await make_response(format_as_ndjson(log_wrapper(result)))
             response.timeout = None  # type: ignore
             response.mimetype = "application/json-lines"
             return response
