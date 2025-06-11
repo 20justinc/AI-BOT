@@ -557,21 +557,10 @@ class RagResponder:
 
         logging.debug(f"RAG_DEBUG: Retrieved {len(results)} documents")
 
-        # 2) If we have documents, use RAG; otherwise fall back to plain OpenAI chat
-        if results:
-            logging.info("RAG_DEBUG: Using RAG stream with retrieved docs")
-            chat_coroutine = self._rag_stream(
-                docs=results,
-                user_query=original_user_query,
-                stream=should_stream,
-            )
-        else:
+        # Track if we retrieved any documents for later decision making
+        results_found = bool(results)
+        if not results_found:
             logging.warning("RAG_DEBUG: 0 docs — falling back to plain OpenAI chat")
-            chat_coroutine = self.openai_client.chat.completions.create(
-                model=self.chatgpt_deployment or self.chatgpt_model,
-                messages=[{"role": self.USER, "content": original_user_query}],
-                stream=should_stream,
-            )
 
         sources_content = self.get_sources_content(results, use_semantic_captions, use_image_citation=False)
         content = "\n".join(sources_content)
@@ -645,11 +634,23 @@ class RagResponder:
             "citation_map": self._build_citation_map(results) if results else {},
         }
 
-        # Invoke the OpenAI chat completion directly
-        logging.info(f"RAG_DEBUG: Preparing to call OpenAI completions.create. stream={should_stream}")
+        if should_stream and results_found:
+            logging.info("RAG_DEBUG: Returning RAG stream coroutine")
+
+            async def _wrapper():
+                return self._rag_stream(
+                    docs=results,
+                    user_query=original_user_query,
+                    stream=True,
+                )
+
+            return extra_info, _wrapper()
+
+        logging.info(
+            f"RAG_DEBUG: Preparing to call OpenAI completions.create. stream={should_stream}"
+        )
         logging.info(f"RAG_DEBUG: OpenAI client type: {type(self.openai_client)}")
 
-        # Directly assign the coroutine—let any exception bubble up so we don't end up with None
         chat_coroutine = self.openai_client.chat.completions.create(
             model=self.chatgpt_deployment or self.chatgpt_model,
             messages=messages_new,
@@ -657,9 +658,9 @@ class RagResponder:
             max_tokens=response_token_limit,
             n=1,
             stream=should_stream,
-            seed=123
+            seed=123,
         )
-        
+
         logging.debug(f"RAG_DEBUG: chat_coroutine assigned: {repr(chat_coroutine)}")
 
         return extra_info, chat_coroutine
